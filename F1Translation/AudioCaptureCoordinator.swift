@@ -1,6 +1,8 @@
 import Foundation
-import ScreenCaptureKit
 import AVFoundation
+
+#if os(macOS)
+import ScreenCaptureKit
 
 public final class AudioCaptureCoordinator: NSObject, SCStreamOutput, AudioCaptureService {
     private var stream: SCStream?
@@ -60,3 +62,49 @@ public final class AudioCaptureCoordinator: NSObject, SCStreamOutput, AudioCaptu
         }
     }
 }
+#else
+public final class AudioCaptureCoordinator: NSObject, AudioCaptureService {
+    private let audioEngine = AVAudioEngine()
+    private let converter = AudioFormatConverter()
+    
+    public private(set) var isCapturing: Bool = false
+    public var onAudioBufferReceived: ((AVAudioPCMBuffer) -> Void)?
+    
+    public func startCapture() throws {
+        guard !isCapturing else { return }
+        
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, options: [.mixWithOthers, .defaultToSpeaker])
+        try session.setActive(true)
+        
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+            guard let self = self else { return }
+            do {
+                let convertedBuffer = try self.converter.convert(pcmBuffer: buffer)
+                self.onAudioBufferReceived?(convertedBuffer)
+            } catch {
+                print("오디오 변환 오류: \(error)")
+            }
+        }
+        
+        try audioEngine.start()
+        isCapturing = true
+    }
+    
+    public func stopCapture() {
+        guard isCapturing else { return }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        
+        let session = AVAudioSession.sharedInstance()
+        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        
+        isCapturing = false
+    }
+}
+#endif
+
+

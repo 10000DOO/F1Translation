@@ -1,480 +1,550 @@
-# Implementation Plan: F1 Translation App
+# Implementation Plan: F1 Translation App (iOS/iPadOS 18+)
 
-본 문서는 macOS 15+ 기반의 실시간 시스템 오디오 캡처, 온디바이스 STT 및 번역, Floating Subtitle Overlay 애플리케이션 개발을 위한 단계별 구현 가이드 및 검증 시나리오를 정의합니다.
+본 문서는 macOS 기반의 프로젝트를 iOS 18+ / iPadOS 18+ 환경으로 포팅하고, 실시간 마이크 오디오 캡처(AVAudioEngine), 온디바이스 STT 및 번역, SwiftUI 및 Picture-in-Picture(PiP) 자막 오버레이 애플리케이션 개발을 위한 단계별 구현 가이드 및 검증 시나리오를 정의합니다.
 
 ---
 
-## 1. 구현 로드맵 및 단계별 가이드 (Phase 1 ~ Phase 6)
+## 1. 프로젝트 대상 플랫폼 변환 가이드라인 (macOS -> iPadOS)
 
-### Phase 1: 프로젝트 기반 설정 및 시스템 권한 정의
+### 1.1. Xcode Target 설정 변환
+1. Xcode의 **Project Navigator**에서 `F1Translation` 프로젝트를 선택합니다.
+2. **Targets** 아래의 `F1Translation` 타겟을 선택한 후 **General** 탭으로 이동합니다.
+3. **Supported Destinations** 항목에서 기존 `macOS`를 삭제하고, `iPad` 및 `iPhone` (Destination)을 추가합니다.
+4. **Minimum Deployments** 항목에서 iOS / iPadOS 버전을 **18.0** 이상으로 상향 조정합니다.
+5. **Build Settings**에서 `Deployment Target`이 `iOS 18.0`으로 설정되었는지 확인합니다.
 
-#### 1.1. 권한 키 선언 (Info.plist)
+### 1.2. Info.plist 권한 구성 키 정의
+마이크 및 온디바이스 음성 인식을 정상적으로 구동하기 위해 다음 키들을 `Info.plist`에 정의합니다.
 ```xml
-<key>NSSpeechRecognitionUsageDescription</key>
-<string>실시간 자막 생성을 위해 온디바이스 음성 인식을 사용합니다.</string>
 <key>NSMicrophoneUsageDescription</key>
-<string>오디오 캡처를 지원하기 위해 마이크 권한이 필요합니다.</string>
+<string>F1 방송의 물리적 소리를 수집하여 번역용 오디오 스트림을 생성하기 위해 마이크 권한이 필요합니다.</string>
+<key>NSSpeechRecognitionUsageDescription</key>
+<string>수집된 영어 음성을 텍스트로 인식하기 위해 온디바이스 음성 인식 권한을 사용합니다.</string>
 ```
 
-#### 1.2. App Sandbox 및 Entitlements
-ScreenCaptureKit으로 시스템 오디오를 캡처할 때, macOS Sandbox 환경에서는 시스템 오디오에 액세스하기 위해 `com.apple.security.device.audio-input` 및 `com.apple.security.temporary-exception.mach-lookup.global-name` 등의 예외 설정이 필요할 수 있습니다. 
-만약 Sandbox 환경에서 차단이 발생할 경우를 대비하여 Sandbox 활성화/비활성화 시의 동작을 사전에 테스트하고, Target Settings에서 Screen Recording 권한을 획득하도록 구현합니다.
+### 1.3. Capabilities 설정 (Background Modes)
+자막 서비스가 백그라운드 및 타 동영상 앱 위에서 지속적으로 돌 수 있게 하려면 백그라운드 모드를 추가해야 합니다.
+1. **Signing & Capabilities** 탭으로 이동합니다.
+2. **+ Capability** 버튼을 눌러 **Background Modes**를 추가합니다.
+3. 다음 옵션을 선택합니다:
+   - `Audio, AirPlay, and Picture in Picture`
+
+---
+
+## 2. 구현 로드맵 및 단계별 가이드 (Phase 1 ~ Phase 6)
+
+### Phase 1: 플랫폼 전환 및 의존성 정비
+
+1. Target 설정을 iPadOS 18+로 전환하고, macOS 전용 API(AppKit 및 ScreenCaptureKit 관련 코드)를 빌드에서 제외하거나 삭제합니다.
+2. `SubtitleOverlayWindow.swift` 파일을 삭제하거나 빌드 타겟에서 해제합니다.
+3. 마이크 권한 요청 및 음성 인식 권한 동의 절차를 앱 진입 시 수행하는 권한 도우미 모듈을 구성합니다.
 
 ---
 
 ### Phase 2: Core Interface 및 Mock 엔진 설계
 
-#### 2.1. 캡처, STT, 번역 인터페이스 정의
-`design_f1_translation.md`에 명시된 `SpeechRecognitionService`, `TranslationService`, `AudioCaptureService` 프로토콜을 각각의 개별 파일로 분리하여 선언합니다.
+#### 2.1. 캡처, STT, 번역 인터페이스 선언
+`design_f1_translation.md`에 맞춰 `SpeechRecognitionService`, `TranslationService`, `AudioCaptureService` 프로토콜을 일관되게 정비합니다.
 
-#### 2.2. Mock 구현을 통한 아키텍처 조립
-실제 오디오 캡처 장비나 API가 완성되기 전에 전체적인 UI 데이터 흐름을 점검하기 위해 Mock 클래스를 구현합니다.
-- `MockSpeechRecognitionService`: 1초 간격으로 영어 텍스트 조각을 발행하는 `AsyncThrowingStream`을 반환합니다.
-- `MockTranslationService`: 입력 영문 뒤에 `"[번역완료]"`를 붙여 반환하는 초간단 지연 모듈을 구성합니다.
+#### 2.2. Mock 구현을 통한 데이터 흐름 확인
+실제 마이크 캡처나 온디바이스 번역 기능이 초기 단계에서 세팅되기 전, UI 데이터 바인딩 동작을 검증하기 위해 Mock 서비스를 준비합니다.
+- `MockAudioCaptureService`: 주기적으로 더미 신호를 흘려보내는 가짜 캡처기.
+- `MockSpeechRecognitionService`: 주기적으로 가상의 영어 대화 텍스트 스트림을 방출.
 
 ---
 
 ### Phase 3: 온디바이스 STT 및 번역 엔진 구현
 
-#### 3.1. Apple Speech Engine (`AppleSpeechRecognitionService`) 구현
-`SFSpeechRecognizer`의 1분 세션 한계를 극복하기 위해 **세션 체이닝(Session Chaining)** 메커니즘을 반영한 실시간 음성 인식 서비스 예시 코드입니다.
+#### 3.1. SFSpeechRecognizer 세션 체이닝 (`AppleSpeechRecognitionService`)
+이 모듈은 50초 단위 세션 순환(Chaining)을 지원하여 1분 세션 강제 종료 한계를 우회합니다. 마이크로부터 들어오는 `AVAudioPCMBuffer`를 연속적으로 큐에 저장한 뒤 새로운 세션 요청에 무손실로 주입합니다.
 
 ```swift
 import Foundation
 import Speech
-import CoreMedia
+import AVFoundation
 
-class AppleSpeechRecognitionService: SpeechRecognitionService {
-    private let recognizer: SFSpeechRecognizer?
+public final class AppleSpeechRecognitionService: SpeechRecognitionService {
+    private let speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     
-    // 세션 체이닝을 위한 상태 변수
-    private var sessionStartTime: Date?
-    private var isResettingSession = false
-    private var temporaryAudioBufferQueue: [CMSampleBuffer] = []
-    private let sessionDurationLimit: TimeInterval = 50.0 // 50초 단위로 순환
+    private var isRunning = false
+    private var sessionTimer: Timer?
+    private var pendingBuffers: [AVAudioPCMBuffer] = []
+    private var isTransitioning = false
+    private var currentContinuation: AsyncThrowingStream<SpeechRecognitionResult, Error>.Continuation?
     
-    var isRunning: Bool = false
-    private var continuation: AsyncThrowingStream<SpeechRecognitionResult, Error>.Continuation?
+    private let queue = DispatchQueue(label: "com.10000doo.F1Translation.speechQueue")
     
-    init() {
-        self.recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    public init() {
+        self.speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
     }
     
-    func startRecognition() async throws -> AsyncThrowingStream<SpeechRecognitionResult, Error> {
-        guard let recognizer = recognizer, recognizer.isAvailable else {
-            throw SpeechRecognitionError.onDeviceNotAvailable
-        }
-        guard recognizer.supportsOnDeviceRecognition else {
-            throw SpeechRecognitionError.onDeviceNotAvailable
-        }
-        
-        isRunning = true
-        
+    public func startRecognition() -> AsyncThrowingStream<SpeechRecognitionResult, Error> {
         return AsyncThrowingStream { continuation in
-            self.continuation = continuation
-            setupNewRecognitionSession()
-            
-            continuation.onTermination = { [weak self] _ in
-                Task {
-                    await self?.stopRecognition()
-                }
-            }
-        }
-    }
-    
-    /// 새로운 인식 세션 수립
-    private func setupNewRecognitionSession() {
-        guard isRunning, let recognizer = recognizer else { return }
-        
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let request = recognitionRequest else { return }
-        
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = true
-        
-        isResettingSession = false
-        sessionStartTime = Date()
-        
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self = self else { return }
-            
-            if let error = error {
-                // 세션 교체 중의 취소 에러는 예외 처리
-                let nsError = error as NSError
-                if nsError.domain == kCLErrorDomain || nsError.code == 203 { // 203: Task Cancelled
+            self.queue.async {
+                guard !self.isRunning else {
+                    continuation.finish(throwing: SpeechRecognitionError.notAvailable)
                     return
                 }
-                self.continuation?.finish(throwing: error)
-                return
+                self.isRunning = true
+                self.currentContinuation = continuation
+                self.startNewSession()
             }
-            
-            if let result = result {
-                let bestTranscription = result.bestTranscription.formattedString
-                let isFinal = result.isFinal
+        }
+    }
+    
+    private func startNewSession() {
+        guard isRunning else { return }
+        
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.requiresOnDeviceRecognition = true
+        self.recognitionRequest = request
+        
+        isTransitioning = false
+        if !pendingBuffers.isEmpty {
+            for buffer in pendingBuffers {
+                request.append(buffer)
+            }
+            pendingBuffers.removeAll()
+        }
+        
+        guard let speechRecognizer = speechRecognizer, speechRecognizer.isAvailable else {
+            currentContinuation?.finish(throwing: SpeechRecognitionError.notAvailable)
+            return
+        }
+        
+        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self = self else { return }
+            self.queue.async {
+                if let error = error {
+                    let nsError = error as NSError
+                    // Task 취소 관련 오류는 통과 처리
+                    if nsError.code == 203 || nsError.code == 301 {
+                        return
+                    }
+                    self.currentContinuation?.yield(with: .failure(SpeechRecognitionError.recognitionFailed(error)))
+                    return
+                }
                 
-                self.continuation?.yield(SpeechRecognitionResult(text: bestTranscription, isFinal: isFinal))
-                
-                if isFinal && !self.isResettingSession {
-                    self.continuation?.finish()
+                if let result = result {
+                    let text = result.bestTranscription.formattedString
+                    let speechResult = SpeechRecognitionResult(text: text, isFinal: result.isFinal)
+                    self.currentContinuation?.yield(speechResult)
                 }
             }
         }
         
-        // 큐에 대기 중이던 임시 버퍼들 방출
-        flushBufferedSamples()
+        sessionTimer?.invalidate()
+        sessionTimer = Timer.scheduledTimer(withTimeInterval: 50.0, repeats: false) { [weak self] _ in
+            self?.queue.async {
+                self?.transitionToNextSession()
+            }
+        }
     }
     
-    /// 50초 제한 도달 시 기존 세션을 안전하게 정리하고 다음 세션으로 교체
-    private func rotateSession() {
-        guard isRunning, !isResettingSession else { return }
-        isResettingSession = true
-        
-        // 기존 세션 완료 요청
-        recognitionRequest?.endAudio()
-        recognitionTask?.finish()
-        
-        recognitionTask = nil
-        recognitionRequest = nil
-        
-        // 즉시 새로운 세션 개설
-        setupNewRecognitionSession()
-    }
-    
-    func stopRecognition() async {
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        recognitionRequest = nil
-        isRunning = false
-        continuation = nil
-        temporaryAudioBufferQueue.removeAll()
-    }
-    
-    func appendAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+    private func transitionToNextSession() {
         guard isRunning else { return }
-        
-        // 세션 교체 중일 경우 버퍼를 임시 큐에 누적하여 누수 방지
-        if isResettingSession {
-            temporaryAudioBufferQueue.append(sampleBuffer)
-            return
-        }
-        
-        // 세션 지속 시간 체크
-        if let startTime = sessionStartTime, Date().timeIntervalSince(startTime) > sessionDurationLimit {
-            rotateSession()
-            temporaryAudioBufferQueue.append(sampleBuffer)
-            return
-        }
-        
-        recognitionRequest?.appendAudioSampleBuffer(sampleBuffer)
+        isTransitioning = true
+        startNewSession()
     }
     
-    private func flushBufferedSamples() {
-        guard let request = recognitionRequest, !isResettingSession else { return }
-        for buffer in temporaryAudioBufferQueue {
-            request.appendAudioSampleBuffer(buffer)
+    public func stopRecognition() {
+        queue.async {
+            self.isRunning = false
+            self.sessionTimer?.invalidate()
+            self.sessionTimer = nil
+            self.recognitionRequest?.endAudio()
+            self.recognitionTask?.cancel()
+            self.recognitionTask = nil
+            self.pendingBuffers.removeAll()
+            self.currentContinuation?.finish()
+            self.currentContinuation = nil
         }
-        temporaryAudioBufferQueue.removeAll()
+    }
+    
+    public func appendAudioBuffer(_ buffer: AVAudioPCMBuffer) {
+        self.queue.async {
+            guard self.isRunning else { return }
+            if self.isTransitioning {
+                self.pendingBuffers.append(buffer)
+            } else if let request = self.recognitionRequest {
+                request.append(buffer)
+            }
+        }
     }
 }
 ```
 
-#### 3.2. Translation Framework (`AppleTranslationService`) 구현
-SwiftUI `.translationTask` 모디파이어를 통해 획득한 `TranslationSession`을 전달받아 구동되도록 설계된 번역 서비스의 예시 코드입니다.
-
-```swift
-import Foundation
-import Translation
-import SwiftUI
-
-class AppleTranslationService: TranslationService {
-    private var activeSession: TranslationSession?
-    
-    func updateSession(_ session: TranslationSession) {
-        self.activeSession = session
-    }
-    
-    func translate(text: String) async throws -> String {
-        guard let session = activeSession else {
-            throw TranslationServiceError.sessionNotAvailable
-        }
-        
-        do {
-            let response = try await session.translate(text)
-            return response.targetText
-        } catch {
-            throw TranslationServiceError.translationFailed(error)
-        }
-    }
-}
-
-// macOS 15+ LanguageAvailability를 활용한 로컬 모델 가용성 사전 검사 기능
-class TranslationAvailabilityChecker {
-    func checkAvailability() async -> Bool {
-        let availability = LanguageAvailability()
-        let status = await availability.status(
-            from: Locale.Language(identifier: "en"),
-            to: Locale.Language(identifier: "ko")
-        )
-        
-        switch status {
-        case .installed:
-            return true
-        case .supported:
-            // 지원되나 다운로드가 필요한 상태
-            return false
-        case .unsupported:
-            return false
-        @unknown default:
-            return false
-        }
-    }
-}
-```
+#### 3.2. Translation Framework (`AppleTranslationService`)
+SwiftUI `.translationTask` 바인딩을 통해 주입된 번역 세션 객체를 받아 비동기 통신을 처리합니다. iOS 18 온디바이스 번역 가용성은 `LanguageAvailability`를 통해 체크합니다.
 
 ---
 
-### Phase 4: ScreenCaptureKit 오디오 파이프라인 개발
+### Phase 4: 마이크 오디오 캡처 파이프라인 개발
 
-#### 4.1. ScreenCaptureKit 오디오 단독 스트림 구성
-비디오 스트림 처리를 배제하고 오직 오디오 정보만 캡처하여 최적의 성능을 낼 수 있도록 구현한 오디오 캡처 매니저 예시 코드입니다. (가짜 비디오 프레임 변환 트릭 배제)
+#### 4.1. AVAudioEngine 오디오 캡처 구현 (`AudioCaptureCoordinator`)
+가상 디바이스 없는 DRM 미디어 재생 시 우회 캡처를 지원하기 위해 마이크 입력을 탭으로 가로챕니다.
 
 ```swift
 import Foundation
-import ScreenCaptureKit
 import AVFoundation
 
-class AudioCaptureCoordinator: NSObject, SCStreamOutput {
-    private var stream: SCStream?
-    private var onAudioBufferReceived: ((CMSampleBuffer) -> Void)?
+public final class AudioCaptureCoordinator: AudioCaptureService {
+    private var audioEngine = AVAudioEngine()
+    private let queue = DispatchQueue(label: "com.10000doo.F1Translation.captureQueue")
     
-    func startAudioCapture(filter: SCContentFilter) async throws {
-        let config = SCStreamConfiguration()
-        // 오디오 정보만 활성화
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
+    public private(set) var isCapturing: Bool = false
+    public var onAudioBufferReceived: ((AVAudioPCMBuffer) -> Void)?
+    
+    private let converter = AudioFormatConverter()
+    
+    public init() {}
+    
+    public func startCapture() throws {
+        guard !isCapturing else { return }
         
-        stream = SCStream(filter: filter, configuration: config, delegate: nil)
+        let session = AVAudioSession.sharedInstance()
+        // playAndRecord 카테고리를 mixWithOthers 및 defaultToSpeaker 옵션과 혼합하여 
+        // 외부 앱의 사운드가 재생되는 동시에 마이크를 통해 캡처할 수 있도록 처리합니다.
+        try session.setCategory(.playAndRecord, options: [.mixWithOthers, .defaultToSpeaker])
+        try session.setActive(true)
         
-        // 중요: addStreamOutput 호출 시 type을 .audio로만 단독 등록
-        // 이 구조를 취하면 비디오 수신 및 가공에 따르는 어떠한 리소스 소모도 발생하지 않습니다.
-        try stream?.addStreamOutput(
-            self,
-            type: .audio,
-            sampleHandlerQueue: DispatchQueue(label: "audio.capture.queue")
-        )
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
         
-        try await stream?.startCapture()
+        inputNode.removeTap(onBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+            guard let self = self else { return }
+            self.queue.async {
+                do {
+                    // 마이크 입력 형식(예: 44.1kHz stereo)을 16kHz mono로 변환
+                    let convertedBuffer = try self.converter.convert(buffer: buffer)
+                    self.onAudioBufferReceived?(convertedBuffer)
+                } catch {
+                    print("오디오 포맷 리샘플링 실패: \(error)")
+                }
+            }
+        }
+        
+        audioEngine.prepare()
+        try audioEngine.start()
+        
+        isCapturing = true
     }
     
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio else { return }
-        onAudioBufferReceived?(sampleBuffer)
-    }
-    
-    func stopCapture() async throws {
-        try await stream?.stopCapture()
-        stream = nil
+    public func stopCapture() {
+        guard isCapturing else { return }
+        
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        
+        let session = AVAudioSession.sharedInstance()
+        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        
+        isCapturing = false
     }
 }
 ```
 
 #### 4.2. 포맷 변환 및 리샘플러 설계 (`AudioFormatConverter`)
-ScreenCaptureKit의 PCM 샘플(예: Float32)을 Speech SDK가 요구하는 포맷으로 실시간 다운샘플링합니다.
+마이크 입력 `AVAudioPCMBuffer`를 Speech SDK 형식(`16kHz mono, 16-bit linear PCM`)으로 리샘플링합니다.
+
 ```swift
+import Foundation
 import AVFoundation
 
-class AudioFormatConverter {
-    private var converter: AVAudioConverter?
-    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+public final class AudioFormatConverter {
+    private let targetFormat: AVAudioFormat
+    private var activeConverter: AVAudioConverter?
+    private var sourceFormat: AVAudioFormat?
     
-    func convert(sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
-        guard let inputFormat = AVAudioFormat(cmAudioFormatDescription: CMSampleBufferGetFormatDescription(sampleBuffer)!) else { return nil }
-        
-        if converter == nil {
-            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
-        }
-        
-        guard let converter = converter else { return nil }
-        
-        // CMSampleBuffer를 AVAudioPCMBuffer로 디코딩 후 변환
-        // ... AVAudioConverter.convert(to:outputBuffer:error:withInputFrom:) 메서드를 이용한 실시간 변환 로직 탑재 ...
-        return nil
-    }
-}
-```
-
----
-
-### Phase 5: Floating UI & Window
-
-#### 5.1. NSPanel 기반 Subtitle Window 제어
-```swift
-import AppKit
-import SwiftUI
-
-class SubtitleOverlayWindow: NSPanel {
-    init(contentView: AnyView) {
-        super.init(
-            contentRect: NSRect(x: 100, y: 100, width: 800, height: 150),
-            styleMask: [.borderless, .nonactivatingPanel, .resizable],
-            backing: .buffered,
-            defer: false
+    public init() {
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: 16000.0,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 2,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 2,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 16,
+            mReserved: 0
         )
-        self.isFloatingPanel = true
-        self.level = .statusBar
-        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        self.backgroundColor = .clear
-        self.isOpaque = false
-        self.hasShadow = false
-        self.isMovableByWindowBackground = true
-        
-        self.contentView = NSHostingView(rootView: contentView)
+        self.targetFormat = AVAudioFormat(streamDescription: &asbd)!
     }
     
-    func toggleClickThrough(_ isEnabled: Bool) {
-        if isEnabled {
-            self.ignoresMouseEvents = true
-        } else {
-            self.ignoresMouseEvents = false
+    public func convert(buffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
+        let inputFormat = buffer.format
+        
+        if self.sourceFormat != inputFormat || activeConverter == nil {
+            self.sourceFormat = inputFormat
+            self.activeConverter = AVAudioConverter(from: inputFormat, to: targetFormat)
         }
-    }
-}
-```
-
-#### 5.2. Debounce 및 비동기 병목을 해결하는 ViewModel 구조 (`SubtitleViewModel`)
-STT 부분 결과로 인한 비동기 연산 병목을 해결하기 위한 **Debouncing** 및 **Task Cancellation** 패턴의 뷰모델 적용 상세 예시입니다.
-
-```swift
-import SwiftUI
-import Combine
-
-@MainActor
-class SubtitleViewModel: ObservableObject {
-    @Published var englishSubtitle: String = ""
-    @Published var koreanSubtitle: String = ""
-    @Published var isClickThrough: Bool = false
-    @Published var overlayOpacity: Double = 0.6
-    
-    private let speechService: SpeechRecognitionService
-    private let translationService: TranslationService
-    
-    private var translationTask: Task<Void, Never>?
-    private var debounceTimer: Timer?
-    
-    init(speechService: SpeechRecognitionService, translationService: TranslationService) {
-        self.speechService = speechService
-        self.translationService = translationService
-    }
-    
-    /// 실시간 STT 업데이트 반영 및 번역 요청 디바운스
-    func handleSpeechResult(_ result: SpeechRecognitionResult) {
-        self.englishSubtitle = result.text
         
-        // 이전 디바운스 타이머 리셋
-        debounceTimer?.invalidate()
+        guard let converter = activeConverter else {
+            throw NSError(domain: "AudioFormatConverter", code: -2, userInfo: [NSLocalizedDescriptionKey: "리샘플링 컨버터 생성 실패"])
+        }
         
-        if result.isFinal {
-            // 문장이 완전히 끝난 경우 디바운스 없이 즉시 고성능 번역 요청
-            triggerTranslation(for: result.text)
-        } else {
-            // 부분 일치 결과(실시간 텍스트)의 경우, 350ms 대기 후 번역 호출
-            debounceTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: false) { [weak self] _ in
-                guard let self = self else { return }
-                Task {
-                    await self.triggerTranslation(for: result.text)
-                }
+        let ratio = targetFormat.sampleRate / inputFormat.sampleRate
+        let outputFrameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+        
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrameCapacity) else {
+            throw NSError(domain: "AudioFormatConverter", code: -4, userInfo: [NSLocalizedDescriptionKey: "출력 버퍼 할당 실패"])
+        }
+        
+        var error: NSError?
+        var inputBlockCalled = false
+        
+        converter.convert(to: outputBuffer, error: &error) { inNumPackets, outStatus in
+            if inputBlockCalled {
+                outStatus.pointee = .noDataNow
+                return nil
             }
+            inputBlockCalled = true
+            outStatus.pointee = .haveData
+            return buffer
         }
-    }
-    
-    /// 비동기 병목 및 리소스 낭비를 막기 위한 번역 태스크 취소 및 처리
-    private func triggerTranslation(for text: String) {
-        // 이미 진행 중인 번역 Task가 있다면 즉시 취소하여 스레드 경합 방지
-        translationTask?.cancel()
         
-        translationTask = Task {
-            do {
-                // Task가 취소되었는지 확인하여 불필요한 번역 API 호출 예방
-                try Task.checkCancellation()
-                
-                let translated = try await translationService.translate(text: text)
-                
-                try Task.checkCancellation()
-                
-                self.koreanSubtitle = translated
-            } catch is CancellationError {
-                // Task가 취소된 경우 아무 작업도 하지 않음
-            } catch {
-                print("Translation Error: \(error.localizedDescription)")
-            }
+        if let error = error {
+            throw error
         }
+        
+        return outputBuffer
     }
 }
 ```
 
 ---
 
-### Phase 6: 메뉴바 & 통합 및 SwiftUI 세션 바인딩
+### Phase 5: Picture-in-Picture (PiP) 자막 오버레이 통합
 
-#### 6.1. MenuBarExtra 연동 및 전역 제어
-SwiftUI `MenuBarExtra` 또는 `NSStatusItem`을 활용해 시스템 상태 바 메뉴를 로드합니다.
-- 메뉴에서 타겟 앱 목록 갱신 및 선택 이벤트를 바인딩합니다.
-- `Cmd + Option + C` 키 입력 이벤트를 감지하여 `SubtitleOverlayWindow` 인스턴스의 `toggleClickThrough`를 실시간 호출하도록 연동합니다.
+iPadOS는 앱 화면을 이탈했을 때 다른 동영상 스트림 위에 별도 뷰를 플로팅할 수 없으므로, **AVSampleBufferDisplayLayer 기반의 Picture-in-Picture(PiP)** 렌더링 방식을 사용하여 실시간 번역 자막을 홈 화면 및 외부 앱 위에 표시합니다.
 
-#### 6.2. SwiftUI View 계층의 세션 획득 및 업데이트 연동
+#### 5.1. PiP 자막 이미지 렌더러 (`PiPSubtitleRenderer`)
+자막 텍스트(영문/국문)를 이미지 데이터 프레임으로 그리는 모듈입니다.
 ```swift
-import SwiftUI
-import Translation
+import UIKit
+import CoreMedia
+import AVFoundation
 
-struct SubtitleOverlayView: View {
-    @ObservedObject var viewModel: SubtitleViewModel
-    let translationService: TranslationService
+public final class PiPSubtitleRenderer {
+    private let size = CGSize(width: 800, height: 160)
     
-    var body: some View {
-        VStack {
-            Text(viewModel.englishSubtitle)
-                .font(.title2)
-                .foregroundColor(.white)
-            Text(viewModel.koreanSubtitle)
-                .font(.title)
-                .bold()
-                .foregroundColor(.yellow)
-        }
-        .padding()
-        // SwiftUI 번역 태스크 트리거로 세션 동적으로 획득
-        .translationTask(
-            .init(source: .init(identifier: "en"), target: .init(identifier: "ko"))
-        ) { session in
-            // 획득한 세션을 TranslationService에 동적으로 전달
-            translationService.updateSession(session)
+    public init() {}
+    
+    public func renderSubtitleFrame(original: String, translated: String, opacity: Double) -> CMSampleBuffer? {
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { context in
+            // 배경 투명도 설정
+            let rect = CGRect(origin: .zero, size: size)
+            UIColor.black.withAlphaComponent(opacity).setFill()
+            context.fill(rect)
             
-            // 세션 유효 기간 동안 대기 구조 유지
-            try? await Task.sleep(nanoseconds: UInt64.max)
+            // 영문 텍스트 렌더링
+            let originalAttributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 22, weight: .medium),
+                .foregroundColor: UIColor.white
+            ]
+            let originalSize = original.size(withAttributes: originalAttributes)
+            let originalRect = CGRect(
+                x: (size.width - originalSize.width) / 2,
+                y: 20,
+                width: originalSize.width,
+                height: originalSize.height
+            )
+            original.draw(in: originalRect, withAttributes: originalAttributes)
+            
+            // 국문 텍스트 렌더링
+            let translatedAttributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 26, weight: .bold),
+                .foregroundColor: UIColor.yellow
+            ]
+            let translatedSize = translated.size(withAttributes: translatedAttributes)
+            let translatedRect = CGRect(
+                x: (size.width - translatedSize.width) / 2,
+                y: 75,
+                width: translatedSize.width,
+                height: translatedSize.height
+            )
+            translated.draw(in: translatedRect, withAttributes: translatedAttributes)
         }
+        
+        return createSampleBuffer(from: image)
     }
+    
+    private func createSampleBuffer(from image: UIImage) -> CMSampleBuffer? {
+        guard let cgImage = image.cgImage else { return nil }
+        
+        var pixelBuffer: CVPixelBuffer?
+        let attrs = [
+            kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue
+        ] as CFDictionary
+        
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            Int(size.width),
+            Int(size.height),
+            kCVPixelFormatType_32ARGB,
+            attrs,
+            &pixelBuffer
+        )
+        
+        guard status == kCVReturnSuccess, let buffer = pixelBuffer else { return nil }
+        
+        CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags(rawValue: 0))
+        let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer),
+            width: Int(size.width),
+            height: Int(size.height),
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+        )
+        
+        guard let ctx = context else {
+            CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags(rawValue: 0))
+            return nil
+        }
+        
+        ctx.draw(cgImage, in: CGRect(origin: .zero, size: size))
+        CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags(rawValue: 0))
+        
+        // Sample Buffer로 변환 및 포맷 정보 작성
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: 10),
+            presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+            decodeTimeStamp: .invalid
+        )
+        
+        var formatDescription: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescriptionOut: &formatDescription
+        )
+        
+        guard let desc = formatDescription else { return nil }
+        
+        var sampleBuffer: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescription: desc,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
+        )
+        
+        return sampleBuffer
+    }
+}
+```
+
+#### 5.2. PiP 매니저 구축 (`PiPManager`)
+`AVSampleBufferDisplayLayer`와 `AVPictureInPictureController`를 활용하여 시스템 PiP 오버레이 세션을 실행하고 렌더링된 자막 프레임을 화면으로 발송합니다.
+```swift
+import AVKit
+
+public final class PiPManager: NSObject, AVPictureInPictureControllerDelegate {
+    public static let shared = PiPManager()
+    
+    private var sampleLayer: AVSampleBufferDisplayLayer?
+    private var pipController: AVPictureInPictureController?
+    private let renderer = PiPSubtitleRenderer()
+    
+    public func setupPiP(with layer: AVSampleBufferDisplayLayer) {
+        self.sampleLayer = layer
+        
+        let source = AVPictureInPictureController.ContentSource(
+            sampleBufferDisplayLayer: layer,
+            playbackDelegate: self
+        )
+        
+        pipController = AVPictureInPictureController(contentSource: source)
+        pipController?.delegate = self
+    }
+    
+    public func startPiP() {
+        guard let pip = pipController, !pip.isPictureInPictureActive else { return }
+        pip.startPictureInPicture()
+    }
+    
+    public func stopPiP() {
+        pipController?.stopPictureInPicture()
+    }
+    
+    public func updateSubtitle(original: String, translated: String, opacity: Double) {
+        guard let pip = pipController, pip.isPictureInPictureActive,
+              let buffer = renderer.renderSubtitleFrame(original: original, translated: translated, opacity: opacity) else { return }
+        
+        sampleLayer?.enqueue(buffer)
+    }
+}
+
+extension PiPManager: AVPictureInPictureSampleBufferPlaybackDelegate {
+    public func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {}
+    public func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
+        return CMTimeRange(start: .zero, duration: .indefinite)
+    }
+    public func pictureInPictureControllerIsPlaybackActive(_ pictureInPictureController: AVPictureInPictureController) -> Bool { return true }
+    public func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newSize: CMVideoFormatDescription) {}
+    public func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime) async {}
 }
 ```
 
 ---
 
-## 2. 검증 계획 및 테스트 케이스 (Validation Plan)
+### Phase 6: SwiftUI 기반 App UI 및 전체 결합
 
-### 2.1. 유닛 테스트 시나리오
-- **STT 세션 체이닝(Chaining) 유효성**:
-  - 인식기를 활성화하고 100초 동안 임의의 오디오 데이터를 흘려보냈을 때, 50초 경과 시점에 정상적으로 `rotateSession()`이 트리거되는지, 그 전후로 들어온 데이터가 유실되지 않고 병합되어 출력되는지 검증.
-- **번역 태스크 취소성 테스트**:
-  - `TranslationService` 호출 도중 `Task.cancel()`이 트리거되었을 때, `CancellationError`가 정상 검출되며 가중치 연산 스레드 점유율이 0%로 빠르게 수렴하는지 확인.
+#### 6.1. 메인 App 구조 (`F1TranslationApp.swift`)
+```swift
+import SwiftUI
 
-### 2.2. 매뉴얼 테스트 시나리오 (Checklist)
+@main
+struct F1TranslationApp: App {
+    @StateObject private var viewModel = SubtitleViewModel(translationService: AppleTranslationService())
+    
+    var body: some Scene {
+        WindowGroup {
+            ContentView(viewModel: viewModel)
+        }
+    }
+}
+```
 
-| ID | 테스트 분류 | 시나리오 및 기대 동작 | 상태 |
-| :--- | :--- | :--- | :--- |
-| **TC-01** | 번역 병목 검증 | 영어 오디오를 5초간 쉬지 않고 발성하여 STT 텍스트가 수십 차례 변동할 때, CPU 사용률이 50%를 넘지 않고 마지막 최종 한글 자막이 0.5초 이내에 출력되는가? | |
-| **TC-02** | 모델 설치 폴백 | 로컬 번역 모델이 아직 설치되지 않은 청정 macOS 환경에서 실행 시, 오류로 크래시가 나지 않고 "모델 다운로드 대기 중" 알림이 오버레이에 정상 표출되는가? | |
-| **TC-03** | 클릭 통과 | `ignoresMouseEvents` 속성이 true일 때, 자막 영역 내부를 정확히 클릭해도 하단의 브라우저나 데스크톱 파일이 무리 없이 선택되는가? | |
-| **TC-04** | 화면 영역 복구 | 해상도 변경 혹은 모니터 연결이 해제된 이후에도 자막 오버레이 윈도우가 가시 영역 내로 자동 배치되는가? | |
-| **TC-05** | 오디오 단독 점유 | ScreenCaptureKit 구동 시 CPU 프로파일러 상에서 Video 관련 렌더 프레임워크 스택이 호출되지 않는가? | |
-| **TC-06** | 1분 한계 돌파 | 오디오 캡처를 지속한 지 3분 이상 지난 상태에서도 끊임 없이 영문 텍스트 인식이 들어오는가? | |
+#### 6.2. SwiftUI Local Subtitle View 및 제어 인터페이스 (`ContentView.swift`)
+자막 활성화 토글, 번역 상태 표시 및 PiP 기능을 키고 끌 수 있는 제어 화면을 구성합니다.
+자막 뷰 하단에는 `.translationTask` 모디파이어를 제공해 `AppleTranslationService`에 세션을 전달합니다.
+
+---
+
+## 3. 검증 계획 및 테스트 케이스 (Validation Plan)
+
+### 3.1. iPad 실기기 테스트 및 검증 시나리오
+AVAudioEngine 및 PiP는 iOS/iPadOS 시뮬레이터 상에서 권한 승인 오류나 하드웨어 입출력 부재로 오작동하기 쉽습니다. 따라서 **iPad 실기기(iPad OS 18.0 이상)** 에서의 검증이 필수입니다.
+
+#### TC-01: 마이크 권한 거부 대응성
+- **방법**: 앱 최초 실행 시 마이크 권한 요청 팝업에서 "허용 안 함"을 탭합니다.
+- **예상 결과**: 자막 활성화 토글 시 에러 알림창이 팝업되며 권한 설정으로 유도하는 안내 문구가 표시되어야 합니다.
+
+#### TC-02: DRM 오디오 동시 재생 및 캡처 검증
+- **방법**: Safari에서 DRM이 가미된 미디어나 F1 라이브 방송(F1 TV)을 볼륨 50% 수준으로 재생합니다. 그 상태에서 F1Translation 앱을 Slide Over로 활성화한 뒤 자막 가동을 시작합니다.
+- **예상 결과**: DRM 콘텐츠의 재생이 멈추거나 마스킹되지 않고, 스피커로 출력되는 오디오 음성에 비례하여 STT가 정상적으로 영어 문장을 텍스트화해야 합니다.
+
+#### TC-03: Picture-in-Picture(PiP) 활성화 및 연동 검증
+- **방법**: 앱 메인 화면에서 "PiP 모드 시작"을 탭하여 플로팅 자막 레이어를 화면에 띄웁니다. 그 후 F1Translation 앱을 아래로 쓸어내려 백그라운드(홈 화면)로 이탈합니다.
+- **예상 결과**: 홈 화면 또는 F1 TV 풀스크린 방송 위로 투명/검정 배경의 자막 바가 떠 있어야 하며, STT 인식 및 한글 번역 결과가 실시간으로 PiP 자막 박스 텍스트로 업데이트되어야 합니다.
+
+#### TC-04: 장시간 작동 시 세션 로테이션 (50초 제한 극복)
+- **방법**: 오디오 재생 상태를 3분 이상 길게 유지하여 자막 처리를 모니터링합니다.
+- **예상 결과**: 50초 경과 시점에 오디오 수집 흐름이 중단되지 않고, 텍스트가 유실 없이 연속적으로 렌더링되어야 합니다.
+
+#### TC-05: 주변 노음(Noise) 내성 및 스피커 인식 한계
+- **방법**: 약 10dB 수준의 가벼운 백그라운드 노이즈(선풍기 등)가 존재하는 방 안에서 스피커 볼륨을 30%, 50%, 70%로 바꾸며 STT 정확도를 비교합니다.
+- **예상 결과**: 50% 이상 볼륨에서는 F1 해설진의 목소리가 잡음에 묻히지 않고 대략 85% 이상의 단어 정확도로 번역 자막에 나타나야 합니다.

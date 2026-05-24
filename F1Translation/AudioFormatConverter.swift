@@ -1,6 +1,5 @@
 import Foundation
 import AVFoundation
-import CoreMedia
 
 public final class AudioFormatConverter {
     private let targetFormat: AVAudioFormat
@@ -23,13 +22,8 @@ public final class AudioFormatConverter {
         self.targetFormat = AVAudioFormat(streamDescription: &asbd)!
     }
     
-    public func convert(sampleBuffer: CMSampleBuffer) throws -> AVAudioPCMBuffer {
-        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let sourceASBD = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
-            throw NSError(domain: "AudioFormatConverter", code: -1, userInfo: [NSLocalizedDescriptionKey: "포맷 서술자를 읽지 못했습니다."])
-        }
-        
-        let sourceFormat = AVAudioFormat(streamDescription: sourceASBD)!
+    public func convert(pcmBuffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
+        let sourceFormat = pcmBuffer.format
         
         if self.sourceFormat != sourceFormat || activeConverter == nil {
             self.sourceFormat = sourceFormat
@@ -40,12 +34,8 @@ public final class AudioFormatConverter {
             throw NSError(domain: "AudioFormatConverter", code: -2, userInfo: [NSLocalizedDescriptionKey: "변환기 생성 실패"])
         }
         
-        guard let inputPCMBuffer = makePCMBuffer(from: sampleBuffer, format: sourceFormat) else {
-            throw NSError(domain: "AudioFormatConverter", code: -3, userInfo: [NSLocalizedDescriptionKey: "입력 버퍼 래핑 실패"])
-        }
-        
         let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
-        let outputFrameCapacity = AVAudioFrameCount(Double(inputPCMBuffer.frameLength) * ratio) + 16
+        let outputFrameCapacity = AVAudioFrameCount(Double(pcmBuffer.frameLength) * ratio) + 16
         guard let outputPCMBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrameCapacity) else {
             throw NSError(domain: "AudioFormatConverter", code: -4, userInfo: [NSLocalizedDescriptionKey: "출력 버퍼 할당 실패"])
         }
@@ -60,7 +50,7 @@ public final class AudioFormatConverter {
             }
             inputBlockCalled = true
             outStatus.pointee = .haveData
-            return inputPCMBuffer
+            return pcmBuffer
         }
         
         if let error = error {
@@ -73,22 +63,5 @@ public final class AudioFormatConverter {
         
         return outputPCMBuffer
     }
-    
-    private func makePCMBuffer(from sampleBuffer: CMSampleBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
-        guard CMSampleBufferGetDataBuffer(sampleBuffer) != nil else { return nil }
-        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
-        let frameCapacity = AVAudioFrameCount(numSamples)
-        
-        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity) else { return nil }
-        pcmBuffer.frameLength = frameCapacity
-        
-        let bufferList = pcmBuffer.mutableAudioBufferList
-        let frameCount: Int32 = Int32(numSamples)
-        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: frameCount, into: bufferList)
-        if status != noErr {
-            return nil
-        }
-        
-        return pcmBuffer
-    }
 }
+
