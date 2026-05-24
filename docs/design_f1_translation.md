@@ -15,8 +15,8 @@
 ## 2. Requirements (요구사항)
 - **대상 OS**: macOS 15.0 이상 (SFSpeechRecognizer 온디바이스 개선 및 Swift Translation API 탑재 기준).
 - **오디오 캡처**: ScreenCaptureKit을 활용한 무설치형 시스템/개별 앱 오디오 캡처 스트림 생성.
-- **STT (Speech-To-Text)**: Apple `SFSpeechRecognizer` 온디바이스 모드를 기본으로 적용하되, 확장 가능한 스트리밍 API 설계.
-- **번역 (Translation)**: macOS 15+ `Translation` 프레임워크의 `Translator` API를 사용해 비동기/온디바이스로 영어 -> 한국어 번역 수행.
+- **STT (Speech-To-Text)**: Apple `SFSpeechRecognizer` 온디바이스 모드를 기본으로 적용하되, 1분 세션 제한을 극복하는 연속 체이닝 아키텍처 설계.
+- **번역 (Translation)**: macOS 15+ `Translation` 프레임워크의 `TranslationSession` API를 사용해 비동기/온디바이스로 영어 -> 한국어 번역 수행.
 - **UI/UX**: 
   - Floating Subtitle Overlay (자막 표시용 반투명 윈도우).
   - 마우스 클릭 통과(Click-Through) 활성화/비활성화 토글.
@@ -39,6 +39,8 @@ graph TD
     TranslationService -->|Translated Korean Subtitle| SubtitleViewModel
     SubtitleViewModel -->|Update Subtitle UI| OverlayView[Subtitle Overlay View]
     
+    OverlayView -->|Provide Session via translationTask| TranslationService
+    
     MenuBar[MenuBar Control Panel] -->|Toggle Click-Through / Transparency| WindowController[SubtitleOverlayWindowController]
     WindowController -->|Control NSWindow Property| OverlayWindow[SubtitleOverlayWindow]
 ```
@@ -47,7 +49,7 @@ graph TD
 1. **SRP (단일 책임 원칙)**:
    - `AudioCaptureCoordinator`: ScreenCaptureKit 셋업 및 오디오 버퍼 가로채기(Intercepting)만 담당.
    - `AudioFormatConverter`: PCM 샘플 포맷 변환 및 리샘플링만 담당.
-   - `SpeechRecognitionService`: 오디오 입력을 비동기적으로 텍스트로 전환하는 단일 목적에 집중.
+   - `SpeechRecognitionService`: 오디오 입력을 비동기적으로 텍스트로 전환하고 1분 세션 제한 리셋(Chaining)을 관리하는 단일 목적에 집중.
    - `TranslationService`: 영어 텍스트를 대상 언어 텍스트로 기계 번역하는 단일 목적에 집중.
    - `SubtitleOverlayWindowController`: 자막이 표현되는 윈도우의 속성(레벨, 투명도, 클릭 통과 등) 제어만 담당.
 2. **OCP (개방-폐쇄 원칙)**:
@@ -112,15 +114,16 @@ protocol SpeechRecognitionService: AnyObject {
 
 ```swift
 import Foundation
+import Translation
 
 /// 번역 엔진 에러 정의
 enum TranslationServiceError: LocalizedError {
-    case modelNotPrepared
+    case sessionNotAvailable
     case translationFailed(Error)
     
     var errorDescription: String? {
         switch self {
-        case .modelNotPrepared: return "온디바이스 번역 모델이 준비되지 않았습니다."
+        case .sessionNotAvailable: return "TranslationSession이 제공되지 않았거나 만료되었습니다."
         case .translationFailed(let error): return "번역 실행 중 오류가 발생했습니다: \(error.localizedDescription)"
         }
     }
@@ -128,8 +131,8 @@ enum TranslationServiceError: LocalizedError {
 
 /// 번역 엔진을 추상화하는 프로토콜
 protocol TranslationService: AnyObject {
-    /// 번역 가용 여부 및 온디바이스 한국어 번역 모델 탑재 여부 체크 및 사전 로드
-    func prepareTranslator() async throws
+    /// SwiftUI .translationTask로부터 획득한 TranslationSession 주입/업데이트
+    func updateSession(_ session: TranslationSession)
     
     /// 입력 텍스트 번역
     /// - Parameters:
@@ -167,23 +170,32 @@ protocol AudioCaptureService: AnyObject {
 
 ## 5. Detailed Design Points (세부 설계 방안)
 
-### 5.1. ScreenCaptureKit 오디오 포맷 리샘플링 설계 (AVAudioConverter)
+### 5.1. ScreenCaptureKit 오디오 단독 스트림 구성 및 리샘플링
 - **이유**: `SFSpeechAudioBufferRecognitionRequest`는 일반적으로 `16kHz, 16-bit linear PCM` 포맷을 필요로 하지만, ScreenCaptureKit(`SCStream`)은 디바이스 환경 및 소스 앱에 따라 다른 PCM 포맷(예: `48kHz Float32`)을 제공합니다.
+- **오디오 단독 스트림 처리**: `SCStream` 인스턴스에 `addStreamOutput`을 수행할 때 `.screen`과 같은 비디오 출력을 생략하고 오로지 `.audio` 출력만 등록합니다. 이렇게 하면 GPU/CPU 부하를 유발하는 비디오 프레임 처리가 원천적으로 배제되므로, 16x16 픽셀 크기 변환과 같은 비디오 튜닝 우회책 없이 리소스를 최적화할 수 있습니다.
 - **해결책**: `AudioFormatConverter` 클래스를 생성하여 `SCStreamOutput`에서 넘어오는 `CMSampleBuffer`를 받아 `AVAudioPCMBuffer`로 읽어 들인 뒤, `AVAudioConverter`를 통해 타겟 포맷인 `AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)`로 실시간 다운샘플링합니다.
 
 ### 5.2. 비동기 처리 병목 해결 및 Debouncing/Cancellation 전략
-- **이유**: 사용자가 실시간으로 말할 때 `SFSpeechRecognizer`는 음절 단위의 잦은 부분 인식 결과(`isFinal == false`)를 다량으로 쏟아냅니다. 이를 즉시 번역 모델(온디바이스 `Translator`)에 매번 비동기로 전달하면 심각한 스레드 경합(Thread Contention) 및 신경망 계산 병목이 발생하여 UI가 얼거나 레이턴시가 수 초 이상 벌어집니다.
+- **이유**: 사용자가 실시간으로 말할 때 `SFSpeechRecognizer`는 음절 단위의 잦은 부분 인식 결과(`isFinal == false`)를 다량으로 쏟아냅니다. 이를 즉시 번역 모델(온디바이스 `TranslationSession`)에 매번 비동기로 전달하면 심각한 스레드 경합(Thread Contention) 및 신경망 계산 병목이 발생하여 UI가 얼거나 레이턴시가 수 초 이상 벌어집니다.
 - **해결책**:
   1. **Debounce (디바운스) 적용**: 수신되는 임시 텍스트 스트림을 SwiftUI 뷰모델 내부에서 디바운싱(예: 350ms)합니다. 이 시간 동안 새로운 텍스트 파편이 들어오지 않을 때만 최종 번역 연산을 요청합니다.
   2. **Task Cancellation (작업 취소)**: 번역을 수행하는 Task(`translationTask`)를 뷰모델의 멤버 변수로 유지하며, 새로운 텍스트가 디바운스를 거쳐 유효 번역 요청으로 격상될 때, 이전에 실행 중이던 번역 비동기 Task가 있다면 즉시 `cancel()`을 호출하여 불필요한 번역 계산을 중단시킵니다.
   3. **Sentence Segment Filtering**: 이전 텍스트와 현재 텍스트를 비교하여 어휘나 의미 구조가 실질적으로 바뀌지 않은 경우(예: 화이트스페이스 차이 등) 번역 호출을 스킵하는 최적화 패스(Filter)를 추가합니다.
 
-### 5.3. Floating Window UI 및 AppKit-SwiftUI 하이브리드 제어
-- **윈도우 레벨링 및 트래킹**: `NSPanel`을 사용해 `level = .statusBar`로 띄워 메인 메뉴바 및 타 앱 윈도우 위로 항상 노출시킵니다.
-- **Click-Through (클릭 통과)**: 
-  - `ignoresMouseEvents = true`일 때는 마우스 클릭이 창을 통과하여 뒤에 있는 사물을 클릭합니다.
-  - `ignoresMouseEvents = false`일 때는 마우스 드래그를 통해 자막창 위치를 이동시키고, 불투명도 슬라이더 등 내부 위젯을 조작할 수 있습니다.
-  - 이 두 모드의 전환은 윈도우 하단에 배치된 스위치 버튼이나 트레이 아이콘을 통해 가능하게 설계하고, 상태가 바뀔 때 윈도우의 속성을 동적으로 수정하도록 구현합니다.
+### 5.3. TranslationSession의 라이프사이클 및 SwiftUI 연동
+- **이유**: Apple Translation 프레임워크는 외부에서 임의로 인스턴스화할 수 있는 `Translator` 클래스를 제공하지 않으며, SwiftUI 뷰 모디파이어인 `.translationTask`가 제공하는 `TranslationSession`을 통해서만 온디바이스 번역 기능이 작동합니다.
+- **해결책**:
+  1. SwiftUI 자막 뷰 계층에서 `.translationTask` 모디파이어를 선언합니다.
+  2. 해당 모디파이어의 클로저에서 제공하는 `TranslationSession` 객체를 `TranslationService` 구현체에 주입(`updateSession`)합니다.
+  3. 뷰모델이나 서비스 백엔드는 주입된 세션 객체를 안전하게 보관하고, 비동기 번역 요청(`translate(text:)`)이 오면 이 세션을 경유하여 처리합니다.
+  4. 로컬 언어팩 설치 검사는 `LanguageAvailability`를 사용하여 영어-한국어 페어가 온디바이스 번역 가능 상태인지 사전 판정합니다.
+
+### 5.4. SFSpeechRecognizer 세션 체이닝 (1분 제한 대응)
+- **이유**: `SFSpeechRecognizer`는 단일 인식 세션 지속 시간이 약 1분으로 제한되어 있습니다. F1 스포츠 경기 중계와 같은 장시간 스트리밍 오디오를 처리하려면 세션의 유실 없는 자동 갱신(Chaining)이 필수적입니다.
+- **해결책**:
+  1. **타이머 기반 세션 갱신**: 음성 인식이 시작된 지 50초 경과 시, 현재 인식 중인 `SFSpeechAudioBufferRecognitionRequest`에 `endAudio()`를 전송하고 즉시 내부 세션을 교체할 준비를 합니다.
+  2. **버퍼 임시 홀딩(Buffering)**: 이전 세션이 완전히 정리되고 새 세션의 `SFSpeechRecognitionTask`가 수립되기까지 약 수백 밀리초의 공백이 발생합니다. 이 과도기 동안 `ScreenCaptureKit`에서 유입되는 오디오 버퍼들은 폐기하지 않고 내부 큐(Queue)에 잠시 홀딩합니다.
+  3. **새 세션 개시 및 버퍼 방출**: 새 세션 수립 즉시 큐에 임시 홀딩되어 있던 누적 버퍼들을 순차적으로 새 `SFSpeechAudioBufferRecognitionRequest`에 밀어 넣어 오디오 유실 없는 연속 STT를 보장합니다.
 
 ---
 
@@ -238,9 +250,10 @@ protocol AudioCaptureService: AnyObject {
 
 ## 10. Architect's Checklist (체크리스트)
 - [ ] `Info.plist`에 Speech Recognition 관련 사용 설명 필드가 추가되었는가?
-- [ ] ScreenCaptureKit은 비디오 스트림 렌더링 부하를 회피하기 위해 최소 사양의 스트림 포맷으로 튜닝되어 설계되었는가?
+- [ ] ScreenCaptureKit은 비디오 스트림 처리를 배제하고 오직 `.audio` 출력만 등록하도록 설계되어 CPU/GPU 부하를 최소화했는가?
 - [ ] `SFSpeechRecognizer`에 `requiresOnDeviceRecognition = true` 옵션이 들어가 온디바이스 동작을 보장하는가?
-- [ ] `Translation` 프레임워크의 온디바이스 한국어 언어팩 가용성을 사전에 검증할 수 있는 상태 체킹 장치가 마련되었는가?
+- [ ] `SFSpeechRecognizer`에 50초 주기로 세션을 순환시키는 세션 체이닝(Session Chaining) 구조가 추가되었는가?
+- [ ] `Translation` 프레임워크의 온디바이스 한국어 언어팩 가용성을 `LanguageAvailability` 클래스를 통해 검증하였는가?
 - [ ] `ignoresMouseEvents` 토글 시, 사용자가 자막창을 잃어버리지 않도록 외부 메뉴바에서 클릭 통과 상태를 명확히 끄고 켤 수 있는 제어기가 설계되었는가?
 - [ ] 추후 OpenAI/DeepL 플러그인 교체가 간편하도록 인터페이스 기반 의존성 분리가 완료되었는가?
 - [ ] 빈번한 부분인식 STT 결과가 들어올 때 번역 병목을 줄이기 위해 디바운싱(Debounce) 및 Task Cancellation(취소) 구조가 명시되었는가?
